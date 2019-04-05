@@ -7,6 +7,7 @@
 #include <Wire.h>                                             // I2C bus library
 #include <math.h>                                             // math library
 #include <Servo.h>                                            // Servo library
+#include <IRLibAll.h>
 
 
 // I2C
@@ -23,6 +24,7 @@
 Servo servoG;
 Servo servoR;
 Servo servoL;
+IRsend IRSender;
 #define IDLE_R 90
 #define ACT_R 0
 #define IDLE_L 0
@@ -33,14 +35,26 @@ Servo servoL;
 
 //-------------- CONSTANTS (doesn't change) -----------------
 
-enum FUN { fwd, bwd, rtn, ltn}; // definition of actions
 const double circumference = 10.3 * M_PI; // circumference of wheel
+const int globalAcceleration = 1;
 const int straightSpeed = 30; // speed of wheel during a straight
+const int straightOffset = 30; // 18
 const int cornerSpeed = 20;
+const int cornerOffset = 0;
+const int correctionSpeed = 5;
+const int correctionOffset = 0; //3
 const float d1 = 11; // radius of wheel arc
 const float d2 = 11;
-const int colourPin = 3; // Pin that control which side to go (1 = Purple, 0 = Yellow)
+const int colourPin = 11; // Pin that control which side to go (1 = Purple, 0 = Yellow)
 const int startPin = 2; // Pin that when pull will start the robot motion
+const int trigPinBack = 6;
+const int echoPinBack = 7;
+const int trigPinFront = 4;
+const int echoPinFront = 5;
+const float minGap = 17; // 7 cm
+const long stopTime = 95000; // 95 s
+const int correctionCountMax = 1;
+const unsigned long sonicTimeOut = 50 / 0.01715;
 
 //---------------- VARIABLES (will change) -------------------
 
@@ -50,15 +64,13 @@ int offsetSpeed2;
 unsigned long currentMillis;
 unsigned long previousMillis = 0;
 unsigned long startMillis;
-float offsetS = (15.0 / 360.0) * float(circumference) + 2;
-float offsetC = (9.0 / 360.0) * float(circumference) + 1;
+int correctionCount = 0;
 
 //------------------ FUNCTION PROTOTYPES ---------------------
 
 // Motor functions
 void resetEncoder();
-long encoder1();
-long encoder2();
+long encoder();
 void stopMotor();
 
 // Sides functions
@@ -68,13 +80,23 @@ void yellow();
 // Supporting functions
 int dis2tic(double distance);
 bool timesUp();
+bool collision_forward();
+bool collision_backward();
+void transmission(byte address, int value);
 
 // Movement functions
-void forward();
-void backward();
-void rightTurn();
-void leftTurn();
-void movement(FUN fun, double distance, float angle);
+void drive(int ticks, int speed1, int speed2, int offset,
+           int acceleration = globalAcceleration,
+           bool avoid = false, bool forward = false, 
+           bool correction = true);
+void straight(float distance, bool correction = true,
+              bool avoid = true,
+              int speed = straightSpeed,
+              int acceleration = globalAcceleration,
+              int offset = straightOffset);
+void turn(float angle, int speed = cornerSpeed,
+          int acceleration = globalAcceleration,
+          int offset = cornerOffset);
 
 // Action functions
 void holdAtom();
@@ -87,7 +109,7 @@ void setup() {
   // Serial monitor
   Serial.begin(9600); // start serial monitor
   Serial.println("Eurobot 2019: Team Brobot");
-  
+
   // I2C bus
   Wire.begin();                                               // start I2C
   delay(100);                                                 // wait for things to start up
@@ -107,152 +129,252 @@ void setup() {
   servoG.write(DROP);
   servoR.write(IDLE_R);
   servoL.write(IDLE_L);
-  delay(1000);
+  delay(100);
 
   // Assign Arduino pins
   pinMode(colourPin, INPUT_PULLUP);
   pinMode(startPin, INPUT_PULLUP);
+  pinMode(trigPinFront, OUTPUT);
+  pinMode(trigPinBack, OUTPUT);
+  pinMode(echoPinFront, INPUT);
+  pinMode(echoPinBack, INPUT);
 
   // Do nothing when start cord is not pulled
   //while (digitalRead(startPin) == LOW){/* do nothing */}
 
   // Record starting time
   startMillis = millis();
-  
+  Serial.print("Start time: ");
+  Serial.println(startMillis);
+
   // Decision between sides using a switch
-//  if (digitalRead(colourPin) == HIGH) {
-//    purple();
-//  } else if (digitalRead(colourPin) == LOW) {
-//    yellow();
-//  }
-
-//  movement(bwd, 30, 0);
-//  movement(fwd, 13, 0);
-//  movement(ltn, 0, 90 * (M_PI / 180));
-//  movement(fwd, 18, 0);
-//  movement(bwd, 154, 0);
-//  servoL.write(ACT_L);
-//  delay(600);
-//  servoL.write(IDLE_L);
-//  movement(ltn, 0, 1 * (M_PI / 180));
-//  movement(bwd, 57, 0); // 209 - 161
-//  movement(ltn, 0, 60 * (M_PI / 180));
-//  movement(fwd, 18, 0);
-
-//  movement(bwd, 30, 0);
-//  movement(fwd, 13, 0);
-//  movement(rtn, 0, 90 * (M_PI / 180));
-//  movement(fwd, 18, 0);
-
-  movement(fwd, 20, 0);
-  movement(rtn, 0, 90 * (M_PI / 180));
-  movement(bwd, 20, 0);
-  
-
-//  servoL.write(ACT_L);
-//  servoR.write(ACT_R);
-//  delay(600);
-//  servoL.write(IDLE_L);
-//  servoR.write(IDLE_R);
-//  delay(600);
-  
-
-//  movement(bwd, 12, 0);
-//  movement(ltn, 0, 85 * (M_PI / 180));
-//  movement(bwd, 87, 0);
-//  movement(ltn, 0, 90 * (M_PI / 180));
-//  movement(bwd, 20, 0);
-//  movement(fwd, 145, 0);
-
+  if (digitalRead(colourPin) == HIGH) {
+    purple();
+  } else if (digitalRead(colourPin) == LOW) {
+    yellow();
+  }
 }
 
 //----------------------- FUNCTIONS --------------------------
 
+
+// Function that drive the wheels
+void drive(int ticks, int speed1, int speed2, int offset,
+           int acceleration, bool avoid, bool forward,
+           bool correction) {
+//  Serial.print("Ticks: ");
+//  Serial.println(ticks);
+  int target = ticks - offset;
+//  Serial.print("Target: ");
+//  Serial.println(target);
+  resetEncoder();                                             // reset encoder to 0
+  delay(50);
+  while (abs(encoder(1)) < target && abs(encoder(2)) < target) {
+    if (timesUp()) {
+      return;
+    }
+    if (avoid) {
+      Serial.print("Collision: ");
+      Serial.println(collision(forward));
+      if (collision(forward)) {
+        stopMotor();
+      } else {
+        transmission(ACCELERATION, acceleration); // acceleration
+        transmission(SPEED1, 128 + speed1); // right wheel
+        transmission(SPEED2, 128 + speed2); // left wheel
+      }
+    } else {
+      transmission(ACCELERATION, acceleration); // acceleration
+      transmission(SPEED1, 128 + speed1); // right wheel
+      transmission(SPEED2, 128 + speed2); // left wheel
+    }
+    // Serial monitor
+    Serial.print("Encoders: ");
+    Serial.print(encoder(1));
+    Serial.print("\t");
+    Serial.println(encoder(2));
+  }
+  // Post processing
+  stopMotor();                                                // stop motor
+  delay(200);
+  Serial.print("After stopping: ");
+  Serial.print(encoder(1));
+  Serial.print("\t");
+  Serial.println(encoder(2));
+
+  if (correction){
+    if (correctionCount < correctionCountMax) {
+      correctionCount++;
+      int correctionSpeed1, correctionSpeed2;
+      int diff = abs((abs(encoder(1)) + abs(encoder(2))) / 2 - ticks);
+      Serial.print("Diff: ");
+      Serial.println(diff);
+      if (speed1 > 0) {
+        correctionSpeed1 = correctionSpeed;
+      } else if (speed1 < 0) {
+        correctionSpeed1 = -correctionSpeed;
+      }
+      if (speed2 > 0) {
+        correctionSpeed2 = correctionSpeed;
+      } else if (speed2 < 0) {
+        correctionSpeed2 = -correctionSpeed;
+      }
+  
+      if (abs(encoder(1)) > target && abs(encoder(2)) > target) {
+        drive(diff, -correctionSpeed1, -correctionSpeed2, correctionOffset);
+      } else if (abs(encoder(1)) < target && abs(encoder(2)) < target) {
+        drive(diff, correctionSpeed1, correctionSpeed2, correctionOffset);
+      }
+    }
+  }
+
+  correctionCount = 0;
+}
+
+
+// Function that drive straight
+void straight(float distance, bool correction, bool avoid,
+              int speed, int acceleration, int offset) {
+  bool forward = true;
+  if (distance < 0) {
+    forward = false;
+    drive(-dis2tic(distance), -speed, -speed, offset, acceleration, avoid, forward, correction);
+  } else {
+    drive(dis2tic(distance), speed, speed, offset, acceleration, avoid, forward, correction);
+  }
+}
+
+
+// Function that turn through and angle (degrees)
+void turn(float angle, int speed, int acceleration,
+          int offset) {
+  if (angle > 0) { // left turn
+    drive(dis2tic(angle * (M_PI / 180) * d1), -speed, speed, offset,
+          acceleration);
+  } else {
+    drive(-dis2tic(angle * (M_PI / 180) * d1), speed, -speed, offset,
+          acceleration);
+  }
+}
+
+
 // Function to reset encoder value to 0
 void resetEncoder() {
-  Wire.beginTransmission(MD25ADDRESS);                        // go to MD25 address
-  Wire.write(COMMAND);                                        // go to command register
-  Wire.write(0x20);                                           // reset encoder value to 0
-  Wire.endTransmission();                                     // exit from MD25
+  transmission(COMMAND, 0x20);
   delay(50);                                                  // wait for things to settles
 }
 
 
 // Function to get the value(number of ticks = degrees of wheel turn) of the encoder 1
-long encoder1() {
+long encoder(int encNumber) {
   Wire.beginTransmission(MD25ADDRESS);                        // go to MD25 address
-  Wire.write(ENC1);                                           // send a byte to read encoder 1 value
+  if (encNumber == 1) {
+    Wire.write(ENC1);
+  } else if (encNumber == 2) {
+    Wire.write(ENC2);
+  }
   Wire.endTransmission();
 
   Wire.requestFrom(MD25ADDRESS, 4);                           // request 4 bytes from MD25
-  while (Wire.available() < 4) {/*do nothing*/};              // wait for 4 bytes to arrive
-  long dist1 = Wire.read();                                   // read first byte
-  dist1 <<= 8;                                                // shift the dist1 variable 1 byte to make room to store 2nd byte
-  dist1 += Wire.read();                                       // read second byte
-  dist1 <<= 8;
-  dist1 += Wire.read();                                       // read third byte
-  dist1 <<= 8;
-  dist1 += Wire.read();                                       // read fourth byte
+  while (Wire.available() < 4) {
+    /*do nothing*/
+  };              // wait for 4 bytes to arrive
+  long dist = Wire.read();                                   // read first byte
+  dist <<= 8;                                                // shift the dist1 variable 1 byte to make room to store 2nd byte
+  dist += Wire.read();                                       // read second byte
+  dist <<= 8;
+  dist += Wire.read();                                       // read third byte
+  dist <<= 8;
+  dist += Wire.read();                                       // read fourth byte
   delay(5);                                                   // wait for all the bytes to come through
 
-  return (dist1);
-}
-
-
-// Function to get the value of the encoder 2
-long encoder2() {
-  Wire.beginTransmission(MD25ADDRESS);                        // go to MD25 address
-  Wire.write(ENC2);                                           // send a byte to read encoder 2 value
-  Wire.endTransmission();
-
-  Wire.requestFrom(MD25ADDRESS, 4);                           // request 4 bytes from MD25
-  while (Wire.available() < 4) {/*do nothing*/};              // wait for 4 bytes to arrive
-  long dist2 = Wire.read();                                   // read first byte
-  dist2 <<= 8;                                                // shift the dist2 variable 2 byte to make room to store 2nd byte
-  dist2 += Wire.read();                                       // read second byte
-  dist2 <<= 8;
-  dist2 += Wire.read();                                       // read third byte
-  dist2 <<= 8;
-  dist2 += Wire.read();                                       // read fourth byte
-  delay(5);                                                   // wait for all the bytes to come through
-
-  return (dist2);
+  return (dist);
 }
 
 
 // Function to stop motor
 void stopMotor() {
-  // Set acceleration
-  Wire.beginTransmission(MD25ADDRESS);                        // go to MD25 address
-  Wire.write(ACCELERATION);                                   // go to acceleration register
-  Wire.write(3);                                             // set acceleration to acceleration register 10
-  Wire.endTransmission();
-
-  // Set both motors speed
-  Wire.beginTransmission(MD25ADDRESS);                        // go to MD25 address
-  Wire.write(SPEED1);                                         // go to speed1 register
-  Wire.write(128);                                            // set speed to 0
-  Wire.endTransmission();
-
-  // Stop turning motors
-  Wire.beginTransmission(MD25ADDRESS);                        // go to MD25 address
-  Wire.write(SPEED2);                                         // go to speed2 register
-  Wire.write(128);                                            // set speed to 0
-  Wire.endTransmission();
-
+  transmission(ACCELERATION, 3);
+  transmission(SPEED1, 128);
+  transmission(SPEED2, 128);
   delay(50);
 }
 
 
 // Purple side function
 void purple() {
-  
+  IRtransmission();
+  straight(25, false);
+  straight(10, false, false);
+  straight(-20, false, false);
+  turn(90);
+  straight(-18, false);
+  straight(160);
+  turn(90);
+  straight(-25, false, false);
+  straight(14);
+  turn(90);
+  servoL.write(ACT_L);
+  delay(600);
+  straight(-8, false, true, straightSpeed - 10);
+  servoL.write(IDLE_L);
+  straight(-19);
+  turn(-90);
+  straight(-20, false, false);
+  straight(20);
+  turn(90);
+  straight(-39, true, true, straightSpeed - 10);
+  turn(90);
+  straight(33, false, false);
+  servoG.write(HOLD);
+  turn(5, 5);
+  delay(500);
+  straight(-20);
+  turn(-90);
+  straight(90);
+  turn(-90);
+  straight(-30, false, false);
+  straight(130);
+  straight(20, false, false);
+  servoG.write(DROP);
 }
 
 
 // Yellow side function
 void yellow() {
-  
+  IRtransmission();
+  straight(25, false);
+  straight(10, false, false);
+  straight(-20, false, false);
+  turn(-90);
+  straight(-20, false);
+  straight(157);
+  turn(-90);
+  straight(-25, false, false);
+  straight(14, true);
+  turn(-90);
+  servoR.write(ACT_R);
+  delay(600);
+  straight(-8, false, true, straightSpeed - 10);
+  servoR.write(IDLE_R);
+  straight(-19);
+  turn(90);
+  straight(-20, false, false);
+  straight(20);
+  turn(-90);
+  straight(-39, true, true, straightSpeed - 0);
+  turn(-87);
+  straight(25, false, false);
+  servoG.write(HOLD);
+  straight(-60);
+  turn(90);
+  straight(93);
+  turn(90);
+  straight(-55);
+  straight(-20, false, false);
+  straight(130);
+  straight(20, false, false);
+  servoG.write(DROP);
 }
 
 
@@ -264,194 +386,73 @@ int dis2tic(double distance) {
 }
 
 
-// Function to go forward
-void forward() {
-  do {
-//    // Time check
-//    if (timesUp()){
-//      break;
-//    }
-    
-    Wire.beginTransmission(MD25ADDRESS);                      // go to MD25 address
-    Wire.write(ACCELERATION);                                 // go to acceleration register
-    Wire.write(1);                                            // set acceleration register 1
-    Wire.endTransmission();
-
-    Wire.beginTransmission(MD25ADDRESS);                      // go to MD25 address
-    Wire.write(SPEED1);                                       // go to speed1 register
-    Wire.write(128 + straightSpeed);                          // set absolute value (> 128) of the motor speed for left wheel (1)
-    Wire.endTransmission();
-
-    // Set both motor speed
-    Wire.beginTransmission(MD25ADDRESS);                      // go to MD25 address
-    Wire.write(SPEED2);                                       // go to speed2 register (right)
-    Wire.write(128 + straightSpeed);                          // set absolute value (>128) of motor speed for right wheel (2)
-    Wire.endTransmission();
-    
-    // Serial monitor
-    Serial.print("Encoders: ");
-    Serial.print(encoder1());
-    Serial.print("\t");
-    Serial.println(encoder2());
-  } while (encoder1() < dis2tic(wheel1) && encoder2() < dis2tic(wheel2));
-}
-
-
-// Function to go backward
-void backward() {
-  do {
-//    // Time check
-//    if (timesUp){
-//      break;
-//    }
-    
-    Wire.beginTransmission(MD25ADDRESS);                      // go to MD25 address
-    Wire.write(ACCELERATION);                                 // go to acceleration register
-    Wire.write(1);                                            // set acceleration register 1
-    Wire.endTransmission();
-
-    Wire.beginTransmission(MD25ADDRESS);                      // go to MD25 address
-    Wire.write(SPEED2);                                       // go to speed1 register
-    Wire.write(128 - straightSpeed);                          // set absolute value (< 128) of the motor speed for left wheel (1)
-    Wire.endTransmission();
-
-    // Set both motor speed
-    Wire.beginTransmission(MD25ADDRESS);                      // go to MD25 address
-    Wire.write(SPEED1);                                       // go to speed2 register
-    Wire.write(128 - straightSpeed);                          // set absolute value (< 128) of motor speed for right wheel (2)
-    Wire.endTransmission();
-    
-    // Serial monitor
-    Serial.print("Encoders: ");
-    Serial.print(encoder1());
-    Serial.print("\t");
-    Serial.println(encoder2());
-    
-  } while (encoder1() > dis2tic(wheel1) && encoder2() > dis2tic(wheel2));
-}
-
-
-// Function to turn right (degrees given)
-void rightTurn() {
-  do {
-//    // Time check
-//    if (timesUp){
-//      break;
-//    }
-    
-    Wire.beginTransmission(MD25ADDRESS);                      // go to MD25 address
-    Wire.write(ACCELERATION);                                 // go to acceleration register
-    Wire.write(1);                                            // set acceleration register 5
-    Wire.endTransmission();
-
-    Wire.beginTransmission(MD25ADDRESS);                      // go to MD25 address
-    Wire.write(SPEED1);                                       // go to speed1 register
-    Wire.write(128 + cornerSpeed);                            // set absolute value (forward) of motor speed for left wheel (1)
-    Wire.endTransmission();
-
-    // Set both motor speed
-    Wire.beginTransmission(MD25ADDRESS);                      // go to MD25 address
-    Wire.write(SPEED2);                                       // go to speed2 register
-    Wire.write(128 - cornerSpeed);                            // set absolute value (backward) of motor speed for right wheel (2)
-    Wire.endTransmission();
-    
-    // Serial monitor
-    Serial.print("Encoders: ");
-    Serial.print(encoder1());
-    Serial.print("\t");
-    Serial.println(encoder2());
-  } while (encoder1() < dis2tic(wheel1));                     // move until left wheel moved enough distance since left move more
-}
-
-
-// Function to turn left
-void leftTurn(){
-  do {
-//    // Time check
-//    if (timesUp){
-//      break;
-//    }
-    
-    Wire.beginTransmission(MD25ADDRESS);                      // go to MD25 address
-    Wire.write(ACCELERATION);                                 // go to acceleration register
-    Wire.write(1);                                            // set acceleration register 5
-    Wire.endTransmission();
-
-    Wire.beginTransmission(MD25ADDRESS);                      // go to MD25 address
-    Wire.write(SPEED1);                                       // go to speed1 register
-    Wire.write(128 - cornerSpeed);                            // set absolute value (backward) of motor speed for left wheel (1)
-    Wire.endTransmission();  
-    
-    // Set both motor speed
-    Wire.beginTransmission(MD25ADDRESS);                      // go to MD25 address
-    Wire.write(SPEED2);                                       // go to speed2 register
-    Wire.write(128 + cornerSpeed);                            // set absolute value (forward) of motor speed for right wheel (2)
-    Wire.endTransmission();
-    
-    // Serial monitor
-    Serial.print("Encoders: ");
-    Serial.print(encoder1());
-    Serial.print("\t");
-    Serial.println(encoder2());
-  } while (encoder2() < dis2tic(wheel2));                     // move until right wheel moved enough distance since right move more
-}
-
-
-// Function that produces robot movements
-void movement(FUN fun, double distance, float angle) { // angle in radians
-  switch (fun) {                                              // check the first function input
-    case fwd: {                                               // if forward is chosen
-        wheel1 = distance - offsetS;                                      // set left wheel travel distance
-        wheel2 = distance - offsetS;                                      // set right wheel travel distance
-        forward();                                              // call function to move forward
-        break;                                                  // exit the case
-    }
-    case bwd: {
-        wheel1 = -(distance - offsetS);                                     // negative since moving in reverse
-        wheel2 = -(distance - offsetS);
-        backward();                                             // move backward
-        break;
-    }
-    case rtn: {
-        wheel1 = d1 * angle - offsetC;                                    // set left wheel travel distance based on angle
-        wheel2 = -(d2 * angle - offsetC);                                   // set right wheel travel distance (negative since right wheel move in reverse)
-        rightTurn();                                            // turn right standing still
-        break;
-    }
-    case ltn: {
-        wheel1 = -(d1 * angle - offsetC);                                   // negative since left wheel move in reverse
-        wheel2 = d2 * angle - offsetC;
-        leftTurn();                                             // turn left standing still
-        break;
-    }
-  }
-
-  // Post processing
-  stopMotor();                                                // stop motor
-  Serial.print("After stopping: ");
-  Serial.print(encoder1());
-  Serial.print("\t");
-  Serial.println(encoder2());
-  delay(200);
-  resetEncoder();                                             // reset encoder to 0
-  Serial.print("After reset: ");
-  Serial.print(encoder1());
-  Serial.print("\t");
-  Serial.println(encoder2());
-  delay(100);
-}
-
-
 // Function to determine if 100s is up or not
-bool timesUp(){
+bool timesUp() {
   unsigned long currentMillis = millis();
-  if (currentMillis - startMillis >= 100000){
+  if (currentMillis - startMillis >= stopTime) {
     return true;
-  } else{
-    Serial.print("Time: ");
-    Serial.println(currentMillis);
+  } else {
     return false;
   }
+}
+
+
+// Function to find distances from ultrasonic sensors
+bool collision(bool forward) {
+  float duration, distance;
+
+  if (forward) {
+    // Send out signal
+    digitalWrite(trigPinFront, LOW);
+    delayMicroseconds(5);
+    digitalWrite(trigPinFront, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trigPinFront, LOW);
+
+    // Get signal
+    duration = pulseIn(echoPinFront, HIGH, sonicTimeOut);
+  } else {
+    // Send out signal
+    digitalWrite(trigPinBack, LOW);
+    delayMicroseconds(5);
+    digitalWrite(trigPinBack, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trigPinBack, LOW);
+
+    // Get signal
+    duration = pulseIn(echoPinBack, HIGH, sonicTimeOut);
+  }
+  
+  // Calculate distance in cm
+  delay(10);
+  distance = (duration / 2) * 0.0343;
+  Serial.print("Distance: ");
+  Serial.println(distance);
+
+  if (distance == 0) {
+    return false;
+  } else if (distance < minGap){
+    return true;
+  } else{
+    return false;
+  }
+}
+
+
+// Function that transmit information to MD25 board
+void transmission(byte address, int value) {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(address);
+  Wire.write(value);
+  Wire.endTransmission();
+}
+
+
+// Function that send IR signal
+void IRtransmission(){
+  IRSender.send(SONY,0xa8bca, 20);
+  delay(100);
+  IRSender.send(SONY,0xa8bca, 20);
 }
 
 
